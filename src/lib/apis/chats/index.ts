@@ -1,5 +1,6 @@
 import { WEBUI_API_BASE_URL } from '$lib/constants';
 import { getTimeRange } from '$lib/utils';
+import { stopTasksByChatId } from '..';
 
 export const createNewChat = async (token: string, chat: object, folderId: string | null) => {
 	let error = null;
@@ -301,34 +302,53 @@ export const getSharedChatList = async (token: string = '', page: number = 1, fi
 };
 
 export const getAllChats = async (token: string) => {
-	let error = null;
-
 	const res = await fetch(`${WEBUI_API_BASE_URL}/chats/all`, {
 		method: 'GET',
 		headers: {
-			Accept: 'application/json',
-			'Content-Type': 'application/json',
+			Accept: 'application/x-ndjson',
 			...(token && { authorization: `Bearer ${token}` })
 		}
-	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
-		.then((json) => {
-			return json;
-		})
-		.catch((err) => {
-			error = err;
-			console.error(err);
-			return null;
-		});
+	});
 
-	if (error) {
-		throw error;
+	if (!res.ok) {
+		const err = await res.json();
+		console.error(err);
+		throw err;
 	}
 
-	return res;
+	const reader = res.body?.getReader();
+	if (!reader) {
+		throw new Error('Response body is not readable');
+	}
+
+	const decoder = new TextDecoder();
+	const chats: object[] = [];
+	let buffer = '';
+
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+
+		buffer += decoder.decode(value, { stream: true });
+		const lines = buffer.split('\n');
+		// Keep the last potentially incomplete line in the buffer
+		buffer = lines.pop() ?? '';
+
+		for (const line of lines) {
+			const trimmed = line.trim();
+			if (trimmed) {
+				chats.push(JSON.parse(trimmed));
+			}
+		}
+	}
+
+	// Process any remaining data in the buffer
+	const remaining = buffer.trim();
+	if (remaining) {
+		chats.push(JSON.parse(remaining));
+	}
+
+	return chats;
 };
 
 export const getChatListBySearchText = async (token: string, text: string, page: number = 1) => {
@@ -1057,6 +1077,14 @@ export const updateChatById = async (token: string, id: string, chat: object) =>
 
 export const deleteChatById = async (token: string, id: string) => {
 	let error = null;
+
+	// Stop any background tasks (e.g., streaming generation) before deleting the chat
+	// to prevent orphaned LLM requests that continue running after the chat is removed
+	try {
+		await stopTasksByChatId(token, id);
+	} catch {
+		// Ignore errors from stopTasksByChatId — the chat may already be done or not exist
+	}
 
 	const res = await fetch(`${WEBUI_API_BASE_URL}/chats/${id}`, {
 		method: 'DELETE',
